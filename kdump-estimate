@@ -1,0 +1,825 @@
+#!/bin/bash
+# Kdump memory usage estimation
+
+[[ $dracutbasedir ]] || dracutbasedir=/usr/lib/dracut
+. $dracutbasedir/dracut-functions.sh
+. /lib/kdump/kdump-lib.sh
+. /lib/kdump/kdump-logger.sh
+
+KEXEC=/sbin/kexec
+KEXEC_ARGS=""
+KDUMP_KERNEL=""
+KDUMP_INITRD=""
+
+DEFAULT_SSHKEY="/root/.ssh/kdump_id_rsa"
+DEFAULT_SAVE_PATH=/var/crash
+
+ESTIMATE_RESULTS_DIR="/var/kdump/kdump-estimate/"
+ESTIMATE_TMPDIR=""
+ESTIMATE_TMPMNT=""
+
+# File used to track estimate progress
+# File does not exist: not in a estiamtion process.
+# File is not empty: in a estimation process and status are dumped in this file
+ESTIMATE_STATUS_FILE=/kdump-estimate
+
+# Values that will be stored in ESTIMATE_STATUS_FILE:
+# Which stage the estimation process is in (estimate/result)
+ESTIMATE_STAGE=
+# The temporary dir on dump target used to collect info
+ESTIMATE_DIR=
+# Temporary boosted crashkernel value
+ESTIMATE_MEMORY=
+# The kernel being estimated
+ESTIMATE_KERNEL=
+# The size of initramfs used for estimate
+ESTIMATE_INITRD_SIZE=
+# The time when estimating started
+ESTIMATE_START_TIMESTAMP=
+# The time when estimating started
+ESTIMATE_END_TIMESTAMP=
+# The vmlinuz hard link
+ESTIMATE_KERNEL_HLINK="/boot/kdump-estimate-vmlinuz"
+
+ESTIMATE_STATUS_KEYS=(
+	ESTIMATE_STAGE
+	ESTIMATE_DIR
+	ESTIMATE_MEMORY
+	ESTIMATE_KERNEL
+	ESTIMATE_START_TIMESTAMP
+	ESTIMATE_END_TIMESTAMP
+)
+
+if [[ -f /etc/sysconfig/kdump ]]; then
+	. /etc/sysconfig/kdump
+fi
+
+# initiate the kdump logger
+if ! dlog_init; then
+	echo "failed to initiate the kdump logger."
+	exit 1
+fi
+
+check_vmlinux()
+{
+	# Use readelf to check if it's a valid ELF
+	readelf -h "$1" &> /dev/null || return 1
+}
+
+get_vmlinux_size()
+{
+	local size=0 _msize
+
+	while read -r _msize; do
+		size=$((size + _msize))
+	done <<< "$(readelf -l -W "$1" | awk '/^  LOAD/{print $6}' 2> /dev/stderr)"
+
+	echo $size
+}
+
+try_decompress()
+{
+	# The obscure use of the "tr" filter is to work around older versions of
+	# "grep" that report the byte offset of the line instead of the pattern.
+
+	# Try to find the header ($1) and decompress from here
+	for pos in $(tr "$1\n$2" "\n$2=" < "$4" | grep -abo "^$2"); do
+		if ! type -P "$3" > /dev/null; then
+			ddebug "Signiature detected but '$3' is missing, skip this decompressor"
+			break
+		fi
+
+		pos=${pos%%:*}
+		tail "-c+$pos" "$img" | $3 > "$5" 2> /dev/null
+		if check_vmlinux "$5"; then
+			ddebug "Kernel is extracted with '$3'"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+# Borrowed from linux/scripts/extract-vmlinux
+get_kernel_size()
+{
+	# Prepare temp files:
+	local tmp img=$1
+
+    tmp=$(mktemp /tmp/vmlinux-XXX)
+    trap 'rm -f "$tmp"' 0
+
+	# Try to check if it's a vmlinux already
+	check_vmlinux "$img" && get_vmlinux_size "$img" && return 0
+
+	# That didn't work, so retry after decompression.
+	try_decompress '\037\213\010' xy gunzip "$img" "$tmp" ||
+		try_decompress '\3757zXZ\000' abcde unxz "$img" "$tmp" ||
+		try_decompress 'BZh' xy bunzip2 "$img" "$tmp" ||
+		try_decompress '\135\0\0\0' xxx unlzma "$img" "$tmp" ||
+		try_decompress '\211\114\132' xy 'lzop -d' "$img" "$tmp" ||
+		try_decompress '\002!L\030' xxx 'lz4 -d' "$img" "$tmp" ||
+		try_decompress '(\265/\375' xxx unzstd "$img" "$tmp"
+
+	# Finally check for uncompressed images or objects:
+	[[ $? -eq 0 ]] && get_vmlinux_size "$tmp" && return 0
+
+	# Fallback to use iomem
+	local _size=0 _seg
+	while read -r _seg; do
+		_size=$((_size + 0x${_seg#*-} - 0x${_seg%-*}))
+	done <<< "$(grep -E "Kernel (code|rodata|data|bss)" /proc/iomem | cut -d ":" -f 1)"
+	echo $_size
+}
+
+save_estimate_status()
+{
+	touch "$ESTIMATE_STATUS_FILE"
+	chmod 0600 "$ESTIMATE_STATUS_FILE"
+
+	{
+		for _key in "${ESTIMATE_STATUS_KEYS[@]}"; do
+			echo "$_key=${!_key}"
+		done
+	} > "$ESTIMATE_STATUS_FILE"
+
+	sync
+}
+
+load_estimate_status()
+{
+	local _file=$1 _key _val
+	_file=${_file:-$ESTIMATE_STATUS_FILE}
+
+	if [[ -s $_file ]]; then
+		while IFS="=" read -r _key _val; do
+			if [[ " ${ESTIMATE_STATUS_KEYS[*]} " == *" $_key "* ]]; then
+				declare -g "$_key"="$_val"
+			else
+				derror "Unknown kdump estimate status '$_key'"
+			fi
+		done <<< "$(< "$_file")"
+	else
+		derror "Failed to read estimate status file $_file"
+		return 1
+	fi
+}
+
+clear_estimate_status()
+{
+	mv "$ESTIMATE_STATUS_FILE" "$ESTIMATE_STATUS_FILE.old"
+
+	sync
+}
+
+is_in_estimate_process()
+{
+	[[ -s $ESTIMATE_STATUS_FILE ]]
+}
+
+enable_service()
+{
+	if [[ ! -f /usr/lib/kdump/kdump-estimate.sh ]]; then
+		cp ./kdump-estimate /usr/lib/kdump/kdump-estimate.sh
+	fi
+
+	if [[ ! -f /usr/lib/systemd/system/kdump-estimate.service ]]; then
+		cat > /usr/lib/systemd/system/kdump-estimate.service <<-EOF
+			[Unit]
+			Description=Kdump crash memory usage estimation
+			ConditionPathExists=/kdump-estimate
+			After=kdump.service network.target network-online.target remote-fs.target basic.target
+			OnFailure=kdump-estimate-cleanup.service
+			DefaultDependencies=no
+
+			[Service]
+			Type=oneshot
+			ExecStart=/usr/lib/kdump/kdump-estimate.sh stage-check
+			StandardOutput=journal+console
+
+			[Install]
+			WantedBy=multi-user.target
+		EOF
+	fi
+
+	if [[ ! -f /usr/lib/systemd/system/kdump-estimate-cleanup.service ]]; then
+		cat > /usr/lib/systemd/system/kdump-estimate-cleanup.service <<-EOF
+			[Unit]
+			Description=Kdump crash memory usage estimation failed
+			DefaultDependencies=no
+
+			[Service]
+			Type=oneshot
+			ExecStart=/usr/lib/kdump/kdump-estimate.sh clean
+			StandardOutput=journal+console
+		EOF
+	fi
+
+	systemctl daemon-reload
+	systemctl enable kdump-estimate.service
+}
+
+ensure_service_enabled()
+{
+	if ! systemctl is-enabled kdump-estimate &> /dev/null; then
+		derror "kdump-estimate.service have to be enabled in systemd."
+
+		clear_estimate_status
+
+		exit 1
+	fi
+}
+
+prepare_tempdir()
+{
+	[[ -n $ESTIMATE_TMPDIR ]] && return 0
+
+	ESTIMATE_TMPDIR="$(mktemp -d -t kdump-estimate.XXXXXX)"
+	[ -d "$ESTIMATE_TMPDIR" ] || perror_exit "kdump-estimate: mktemp -p -d -t kdump-estimate.XXXXXX failed."
+	ESTIMATE_TMPMNT="$ESTIMATE_TMPDIR/target"
+
+	trap '
+	ret=$?;
+	is_mounted $ESTIMATE_TMPMNT && umount -f $ESTIMATE_TMPMNT;
+	[[ -d $ESTIMATE_TMPDIR ]] && rm --one-file-system -rf -- "$ESTIMATE_TMPDIR";
+	exit $ret;
+	' EXIT
+
+	# clean up after ourselves no matter how we die.
+	trap 'exit 1;' SIGINT
+}
+
+check_user_confirm()
+{
+	local _confirm
+
+	dwarn "continue? (y/n):"
+	read -r _confirm
+	while [[ $_confirm != 'y' ]]; do
+		if [[ $_confirm == 'n' ]]; then
+			exit 0
+		else
+			echo "Please input (y/n):"
+			read -r _confirm
+		fi
+	done
+
+	return 0
+}
+
+set_estimate_bootentry()
+{
+	local _kernel_entry=$1 _ck_value=$2 _vmlinuz_index
+
+	[[ -f $ESTIMATE_KERNEL_HLINK ]] && unlink "$ESTIMATE_KERNEL_HLINK"
+	ln "$_kernel_entry" "$ESTIMATE_KERNEL_HLINK"
+	grubby --add-kernel="$ESTIMATE_KERNEL_HLINK" --title="kdump-estimate" --initrd="$DEFAULT_INITRD" --copy-default
+	_vmlinuz_index=$(grubby --info="$ESTIMATE_KERNEL_HLINK" | grep index | cut -d'=' -f 2)
+
+	ESTIMATE_KERNEL_ENTRY=$ESTIMATE_KERNEL_HLINK
+
+	grubby --args crashkernel="$_ck_value" --update-kernel="$ESTIMATE_KERNEL_HLINK"
+	grub2-reboot "$_vmlinuz_index"
+
+	save_estimate_status
+}
+
+remove_boot_entry()
+{
+	if [[ -n $ESTIMATE_KERNEL_HLINK ]]; then
+		grubby --remove-kernel="$ESTIMATE_KERNEL_HLINK"
+		unlink "$ESTIMATE_KERNEL_HLINK"
+	fi
+}
+
+remove_service_file()
+{
+	if [[ -f /usr/lib/systemd/system/kdump-estimate.service ]]; then
+		rm -f /usr/lib/systemd/system/kdump-estimate.service
+	fi
+
+	if [[ -f /usr/lib/systemd/system/kdump-estimate-cleanup.service ]]; then
+		rm -f /usr/lib/systemd/system/kdump-estimate-cleanup.service
+	fi
+
+	if [[ -f /usr/lib/kdump/kdump-estimate.sh ]]; then
+		rm -f /usr/lib/kdump/kdump-estimate.sh
+	fi
+
+	systemctl daemon-reload
+}
+
+#get system memory size in the unit of bytes
+get_system_size_in_bytes()
+{
+	sum=$(sed -n "s/\s*\([0-9a-fA-F]\+\)-\([0-9a-fA-F]\+\) : System RAM$/+ 0x\2 - 0x\1 + 1/p" $PROC_IOMEM)
+	echo $((sum))
+}
+
+start_staged_reboot_estimate()
+{
+	local _initrd _confirm _memory _ck_memory _cur_ck_memory
+	local _kdump_kernel _kexec_cmdline _def_kernel
+
+	dwarn "WARNING: This will reboot current system and trigger a panic to"
+	dwarn "         estimate real kdump memory usage, this may take a while."
+	check_user_confirm
+
+	if is_raw_dump_target; then
+		dwarn "ERROR: estimate result for raw dump target is not reliable, kdump requires"
+		dwarn "       a fs storage for the estimation result in capture kernel."
+		exit 1
+	fi
+
+	if [[ $(get_luks_crypt_dev "$(kdump_get_maj_min "$(get_root_fs_device)")") ]] ||
+		[[ $(get_all_kdump_crypt_dev) ]]; then
+		dwarn "WARNING: encrypted device is in use, you will have to input "
+		dwarn "         the password manually after reboot."
+		check_user_confirm
+	fi
+
+	# Check and gather memory info
+	_memory=$(get_system_size_in_bytes)
+	_ck_memory=$((_memory / 1024 / 1024 / 4))
+
+	_cur_ck_memory=$(< /sys/kernel/kexec_crash_size)
+	_cur_ck_memory=$((_cur_ck_memory / 1024 / 1024))
+
+	dinfo "Available system RAM: $((_memory / 1024 / 1024))MB"
+	if [[ $_ck_memory -gt 16384 ]]; then
+		_ck_memory=16384
+	fi
+
+	if [[ $_ck_memory -lt 256 ]]; then
+		derror "System RAM is too small to run an estimation."
+		exit 1
+	fi
+
+	if [[ $_ck_memory -lt $_cur_ck_memory ]]; then
+		_ck_memory=$_cur_ck_memory
+	fi
+
+	dinfo "Will use crashkernel=${_ck_memory}M for estimation."
+
+	dinfo "Kdump kernel is: $KDUMP_KERNEL"
+	_def_kernel=$(grubby --default-kernel)
+	dinfo "Hard reboot mode is enabled, default boot kernel is: $_def_kernel"
+
+	if [[ $KDUMP_KERNEL != "$_def_kernel" ]]; then
+		dwarn "Default boot kernel is not the kdump kernel, estimation might be unreliable."
+		check_user_confirm
+	fi
+
+	ESTIMATE_START_TIMESTAMP=$(date +%s%N)
+	ESTIMATE_STAGE="reboot"
+	ESTIMATE_MEMORY=$((_ck_memory * 1024))
+
+	enable_service
+
+	# rebuild the initramfs
+	kdumpctl rebuild || exit $?
+
+	# ensure kdump service works and fail early if not
+	kdumpctl restart || exit $?
+
+	# Kdump initramfs size
+	ESTIMATE_INITRD_SIZE=$(du -b "$KDUMP_INITRD" | awk '{print $1}')
+
+	save_estimate_status
+
+	# double check, in case user touched the service
+	ensure_service_enabled
+
+	dinfo "Rebooting to estimate kdump memory usage."
+	set_estimate_bootentry "$_def_kernel" "${_ck_memory}M"
+	reboot
+}
+
+retrive_estimate_result_fs()
+{
+	local _target=$1 _fstype=$2 _opt=$3 _estimate_dir=$4 _dest=$5
+	local _mnt _path
+
+	if ! is_mounted "$_target"; then
+		_mnt="$ESTIMATE_TMPMNT"
+		mkdir -p "$_mnt"
+		mount "$_target" "$_mnt" -t "$_fstype" -o defaults || mount_failure "$_target" "" "$_fstype"
+	else
+		_mnt="$(get_mntpoint_from_target "$_target")"
+	fi
+
+	_path=$(get_save_path)
+
+	# Currently just retrive the kexec dmesg for analyze
+	cat "$_mnt/$_path/$_estimate_dir/kexec-dmesg.log" > "$_dest/kexec-dmesg.log"
+
+	rm -rf "${_mnt:?}/$_path/$_estimate_dir/"
+}
+
+retrive_estimate_result_nfs()
+{
+	local _target=$1 _fstype=$2 _opt=$3 _dest=$4 _estimate_dir
+	local _mnt _path
+	
+	_mnt="$ESTIMATE_TMPMNT"
+	mkdir -p "$_mnt"
+	mount "$_target" "$_mnt" -t "$_fstype" -o "$_opt" || mount_failure "$_target" "$_opt" "$_fstype"
+
+	_path=$(get_save_path)
+
+	_date_dir=$(ls -t "$_mnt/$_path"|head -n1)
+	__date_dir=$(basename $_date_dir)
+	ESTIMATE_DIR="$__date_dir"
+	_estimate_dir=$ESTIMATE_DIR
+	
+	# Currently just retrive the kexec dmesg for analyze
+	cat "$_mnt/$_path/$_estimate_dir/kexec-dmesg.log" > "$_dest/kexec-dmesg.log"
+
+	rm -rf "${_mnt:?}/$_path/$_estimate_dir/"
+}
+
+retrive_estimate_result_ssh()
+{
+	local _target=$1 _dest=$2 _estimate_dir
+	local _key _path _ssh_opt
+
+	_key=$(kdump_get_conf_val sshkey)
+	if ! [[ -f $_key ]]; then
+		_key="/root/.ssh/kdump_id_rsa"
+		if ! [[ -f $_key ]]; then
+			derror "Default SSH key '$_key' doesn't exist, no available key to try, exiting."
+			exit 1
+		fi
+	fi
+
+	_ssh_opt=("-i" "$_key" "-o" "BatchMode=yes" "-o" "StrictHostKeyChecking=yes")
+	_path=$(get_save_path)
+
+	_date_dir=$(ssh "${_ssh_opt[@]}" "$_target" "ls -t '$_path' | head -n1")
+	__date_dir=$(basename $_date_dir)
+	ESTIMATE_DIR="$__date_dir"
+	_estimate_dir=$ESTIMATE_DIR
+	# Currently just retrive the kexec dmesg for analyze
+	if ! ssh "${_ssh_opt[@]}" "$_target" cat "$_path/$_estimate_dir/kexec-dmesg.log" > "$_dest/kexec-dmesg.log"; then
+		derror "Failed to retrive estimate result over ssh on '$_target'"
+		exit 1
+		ssh "${_ssh_opt[@]}" "$2" "rm -rf '${_path:?}/$_estimate_dir'"
+	fi
+}
+
+staged_estimate_panic()
+{
+	dinfo "Preparing to trigger a panic."
+	dinfo "Kdump will generate extra data in '$ESTIMATE_DIR' on the dump target."
+	# backup /etc/sysconfig/kdump
+	cp /etc/sysconfig/kdump /etc/sysconfig/kdump.bak
+
+	grep -q 'rd.memdebug=4' /etc/sysconfig/kdump || sed -i '/^KDUMP_COMMANDLINE_APPEND=/ s/"$/ rd.memdebug=4"/' /etc/sysconfig/kdump
+	kdumpctl restart
+	result=$?
+
+	mv /etc/sysconfig/kdump.bak /etc/sysconfig/kdump
+	if [[ $result -ne 0 ]]; then
+		exit $result
+	fi
+
+	ESTIMATE_STAGE="panic"
+	ESTIMATE_PANIC_TIMESTAMP=$(date +%s%N)
+	ESTIMATE_KERNEL=$(uname -r)
+	save_estimate_status
+
+	dinfo "Triggering a kernel panic."
+	echo 1 > /proc/sys/kernel/sysrq
+	echo c > /proc/sysrq-trigger
+}
+
+analyze_result()
+{
+	local _result_dir=$1
+	local _result_dmesg=$_result_dir/kexec-dmesg.log
+	local _cached_usage _uncached_usage _reserve_usage
+
+	local _memfree _memavail _memtotal
+	local _line _i
+
+	while read -r _line; do
+		case $_line in
+		*MemTotal:*)
+			_memtotal=$(echo "$_line" | awk '{print $(NF-1)}')
+			_reserve_usage=$((ESTIMATE_MEMORY - _memtotal))
+			;;
+		*MemFree:*)
+			_memfree=$(echo "$_line" | awk '{print $(NF-1)}')
+			if [[ -n $_memtotal ]]; then
+				_i=$((_memtotal - _memfree))
+				if [[ $_i -lt $_cached_usage ]] || [[ -z $_cached_usage ]]; then
+					_cached_usage="$_i"
+				fi
+			fi
+			;;
+		*MemAvailable:*)
+			_memavail=$(echo "$_line" | awk '{print $(NF-1)}')
+			if [[ -n $_memtotal ]]; then
+				_i=$((_memtotal - _memavail))
+				if [[ $_i -lt $_uncached_usage ]] || [[ -z $_uncached_usage ]]; then
+					_uncached_usage="$_i"
+				fi
+			fi
+			;;
+		esac
+	done <<< "$(grep -A 3 "\[debug_mem\]" "$_result_dmesg")"
+
+	_datedir=$(date +%Y-%m-%d-%T)
+	_estimate_dir=$ESTIMATE_RESULTS_DIR/$_datedir
+
+	mkdir -p "$_estimate_dir"
+	cp $ESTIMATE_STATUS_FILE "$_estimate_dir/status"
+	cp $KDUMP_CONFIG_FILE "$_estimate_dir/kdump.conf"
+	cp "$_result_dmesg" "$_estimate_dir/dmesg"
+	echo "$_cached_usage $_uncached_usage $_reserve_usage" > "$ESTIMATE_TMPDIR/usage"
+	cp "$ESTIMATE_TMPDIR/usage" "$_estimate_dir/usage"
+
+	rm -rf $ESTIMATE_RESULTS_DIR/latest
+	ln -sfr "$_estimate_dir" $ESTIMATE_RESULTS_DIR/latest
+}
+
+staged_estimate_collect_result()
+{
+	local _target _fstype _opt _estimate_dir _temp_dest _ret
+
+	ESTIMATE_KERNEL=$(uname -r)
+	ESTIMATE_STAGE="result"
+	ESTIMATE_END_TIMESTAMP=$(date +%s%N)
+	save_estimate_status
+
+	prepare_tempdir
+	# nfs dump target date name will be change.
+	_vmcore_dir=$(grep "^path" /etc/kdump.conf | cut -d" " -f 2)
+	_date_dir=$(ls -t $_vmcore_dir|head -n1)
+	__date_dir=$(basename $_date_dir)
+	ESTIMATE_DIR="$__date_dir"
+	_estimate_dir=$ESTIMATE_DIR
+	_temp_dest=$ESTIMATE_TMPDIR
+
+	if is_mount_in_dracut_args; then
+		local _dracut_args
+
+		_dracut_args=$(kdump_get_conf_val dracut_args)
+		_target=$(get_dracut_args_target "$_dracut_args")
+		_fstype=$(get_dracut_args_fstype "$_dracut_args")
+		_opt=$(get_dracut_args_fsopts "$_dracut_args")
+
+		retrive_estimate_result_fs "$_target" "$_fstype" "$_opt" "$_estimate_dir" "$_temp_dest"
+
+	elif is_nfs_dump_target; then
+		_target=$(kdump_get_conf_val "nfs\|nfs4")
+
+		retrive_estimate_result_nfs "$_target" nfs defaults "$_temp_dest"
+	elif is_ssh_dump_target; then
+		_target=$(kdump_get_conf_val "ssh")
+
+		retrive_estimate_result_ssh "$_target" "$_temp_dest"
+	else
+		_target=$(get_block_dump_target)
+
+		if is_raw_dump_target; then
+			derror "Unexpected error, unsupported dump target."
+			return 1
+		fi
+
+		_opt=$(get_mntopt_from_target "$_target")
+		_fstype=$(get_fs_type_from_target "$_target")
+
+		retrive_estimate_result_fs "$_target" "$_fstype" "$_opt" "$_estimate_dir" "$_temp_dest"
+	fi
+
+	if ! [[ -s "$_temp_dest/kexec-dmesg.log" ]]; then
+		derror "Failed to retrieve kexec-dmesg.log file for estimation."
+		return 1
+	fi
+
+	analyze_result "$_temp_dest"
+	_ret=$?
+
+	cleanup_estiamte_stage
+	return $_ret
+}
+
+cleanup_estiamte_stage()
+{
+	remove_boot_entry
+	remove_service_file
+	clear_estimate_status
+	systemctl restart kdump
+}
+
+progress_staged_estimate()
+{
+	if ! load_estimate_status; then
+		derror "The estimate process is interrupted unexpectedly."
+		cleanup_estiamte_stage
+	fi
+
+	if [[ $ESTIMATE_STAGE == "reboot" ]]; then
+		staged_estimate_panic
+	elif [[ $ESTIMATE_STAGE == "panic" ]]; then
+		staged_estimate_collect_result
+	else
+		derror "Unknown estimate stage: '$ESTIMATE_STAGE'"
+		cleanup_estiamte_stage
+	fi
+
+	return $?
+}
+
+
+estimate_report()
+{
+	###
+	### File based estimation report
+	###
+	local kdump_mods
+	local -A large_mods
+	local baseline
+	local kernel_size mod_size initrd_size baseline_size runtime_size reserved_size estimated_size recommended_size _cryptsetup_overhead
+	local size_mb=$((1024 * 1024)) size_kb=1024
+
+	if ! [[ -f $KDUMP_INITRD ]]; then
+		derror "kdumpctl estimate: kdump initramfs is not built yet."
+		exit 1
+	fi
+
+	kdump_mods="$(lsinitrd "$KDUMP_INITRD" -f /usr/lib/dracut/hostonly-kernel-modules.txt | tr '\n' ' ')"
+	baseline=$(kdump_get_arch_recommend_size)
+	if [[ ${baseline: -1} == "M" ]]; then
+		baseline=${baseline%M}
+	elif [[ ${baseline: -1} == "G" ]]; then
+		baseline=$((${baseline%G} * 1024))
+	elif [[ ${baseline: -1} == "T" ]]; then
+		baseline=$((${baseline%T} * 1048576))
+	fi
+
+	# The default pre-reserved crashkernel value
+	baseline_size=$((baseline * size_mb))
+	# Current reserved crashkernel size
+	reserved_size=$(< /sys/kernel/kexec_crash_size)
+	# A pre-estimated value for userspace usage and kernel
+	# runtime allocation, 64M should good for most cases
+	runtime_size=$((64 * size_mb))
+	# Kernel image size
+	kernel_size=$(get_kernel_size "$KDUMP_KERNEL")
+	# Kdump initramfs size
+	initrd_size=$(du -b "$KDUMP_INITRD" | awk '{print $1}')
+	# Kernel modules static size after loaded
+	mod_size=0
+	while read -r _name _size _; do
+		if [[ " $kdump_mods " != *" $_name "* ]]; then
+			continue
+		fi
+		mod_size=$((mod_size + _size))
+
+		# Mark module with static size larger than 2M as large module
+		if [[ $((_size / size_mb)) -ge 1 ]]; then
+			large_mods[$_name]=$_size
+		fi
+	done <<< "$(< /proc/modules)"
+
+	# Extra memory usage required for LUKS2 decryption
+	crypt_size=0
+	for _dev in $(get_all_kdump_crypt_dev); do
+		_crypt_info=$(cryptsetup luksDump "/dev/block/$_dev")
+		[[ $(echo "$_crypt_info" | sed -n "s/^Version:\s*\(.*\)/\1/p") == "2" ]] || continue
+		for _mem in $(echo "$_crypt_info" | sed -n "s/\sMemory:\s*\(.*\)/\1/p" | sort -n -r); do
+			crypt_size=$((crypt_size + _mem * 1024))
+			break
+		done
+	done
+
+	if [[ $crypt_size -ne 0 ]]; then
+		if [[ $(uname -m) == aarch64 ]]; then
+			_cryptsetup_overhead=50
+		else
+			_cryptsetup_overhead=20
+		fi
+
+		crypt_size=$((crypt_size + _cryptsetup_overhead * size_mb))
+		echo -e "NOTE: Encrypted kdump target requires extra memory, assuming using the keyslot with maximum memory requirement\n"
+	fi
+
+	###
+	### Reboot based estimation report
+	###
+	local reboot_estimate_dir=$ESTIMATE_RESULTS_DIR/latest
+	local uncached_usage cached_usage reserve_usage reboot_estimate_size=0
+
+	if ! [[ -d $reboot_estimate_dir ]]; then
+		reboot_estimate_dir=""
+	else
+		load_estimate_status "$reboot_estimate_dir/status"
+
+		read -r uncached_usage cached_usage reserve_usage < "$reboot_estimate_dir/usage"
+		reboot_estimate_size=$(((uncached_usage + cached_usage) / 2 + ESTIMATE_INITRD_SIZE + reserve_usage))
+		reboot_estimate_size=$((reboot_estimate_size * size_kb))
+	fi
+
+	estimated_size=$((kernel_size + mod_size + initrd_size + runtime_size + crypt_size))
+	if [[ $reboot_estimate_size -gt $estimated_size ]]; then
+		recommended_size=$reboot_estimate_size
+	else
+		recommended_size=$estimated_size
+	fi
+
+	# There will be a peak usage when initramfs was being unpacked,
+	# two copies of the squashed content will exists at the same time.
+	# This can be removed if there is a way to avoid the peak usage.
+	# TODO: fadump doesn't use squash now.
+	recommended_size=$(( recommended_size + initrd_size ))
+
+	if [[ $baseline_size -gt $recommended_size ]]; then
+		recommended_size=$baseline_size
+	fi
+
+	echo "Reboot estimation:"
+	if [[ $reboot_estimate_dir ]]; then
+		echo "  Last estimation: $(date -d "@${ESTIMATE_START_TIMESTAMP:0:10}")"
+		echo "  Kernel version: $ESTIMATE_KERNEL"
+		echo "  Estimate took: $(((ESTIMATE_END_TIMESTAMP - ESTIMATE_START_TIMESTAMP) / 1000 / 1000 / 1000))s"
+		echo "  Boosted crashkernel: $((ESTIMATE_MEMORY / size_kb))M"
+		echo
+		echo "  Cached memory usage: $((cached_usage / size_kb))M"
+		echo "  Uncached memory usage: $((uncached_usage / size_kb))M"
+		echo "  Reserved memory: $((reserve_usage / size_kb))M"
+		echo "    Note: The reserved memory may be negative because when reserves memory over 4G, also allocates 256M extra low memory for DMA buffers and swiotlb."
+		echo
+		echo "  Average runtime memory usage: $(((reboot_estimate_size + size_mb - 1) / size_mb))M"
+		echo
+
+		if [[ -n $(diff $KDUMP_CONFIG_FILE "$reboot_estimate_dir/kdump.conf" -q) ]] ;then
+			echo "  WARNING: $KDUMP_CONFIG_FILE has changed since last estimation, the result might be outdated."
+		fi
+		if [[ $(uname -r) != "$ESTIMATE_KERNEL" ]] ;then
+			echo "  WARNING: Kernel version has changed since last estimation, the result might be outdated."
+		fi
+
+	else
+		echo "  No result available."
+		echo "  Use \`kdump-estimate estimate\` to do a reboot estimation."
+		echo
+	fi
+
+	echo "First kernel based estimation:"
+	echo "  Reserved crashkernel:    $((reserved_size / size_mb))M"
+	echo
+	echo "  Kernel image size:   $((kernel_size / size_mb))M"
+	echo "  Kernel modules size: $((mod_size / size_mb))M"
+	echo "  Initramfs size:      $((initrd_size / size_mb))M"
+	echo "  Runtime reservation: $((runtime_size / size_mb))M"
+	[[ $crypt_size -ne 0 ]] &&
+		echo "  LUKS required size:  $((crypt_size / size_mb))M"
+	echo -n "  Large modules:"
+	if [[ ${#large_mods[@]} -eq 0 ]]; then
+		echo "    <none>"
+	else
+		echo ""
+		for _mod in "${!large_mods[@]}"; do
+			echo "    $_mod: ${large_mods[$_mod]}"
+		done
+	fi
+
+	if [[ $reserved_size -ge $recommended_size ]]; then
+		recommended_size=$reserved_size
+	fi
+	echo
+	echo "Recommended crashkernel: $((recommended_size / size_mb))M"
+	echo
+	# Leave a 1MB margin
+	if [[ $(( recommended_size - reserved_size )) -gt $size_mb ]]; then
+		echo "WARNING: Current crashkernel size is lower than recommended size $((recommended_size / size_mb))M."
+	fi
+}
+
+# get KDUMP_KERNEL and KDUMP_INITRD.
+prepare_kdump_bootinfo || exit $?
+
+case $1 in
+estimate)
+	start_staged_reboot_estimate
+	;;
+
+report)
+	estimate_report
+	;;
+
+stage-check)
+	progress_staged_estimate || exit $?
+	;;
+
+clean)
+	cleanup_estiamte_stage || exit $?
+	;;
+
+*)
+	echo "Usage: $0 {estimate|report|stage-check|clean}"
+	exit 1
+	;;
+esac

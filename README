@@ -1,0 +1,45 @@
+kdump-estimate
+----------
+
+This is for RHEL/fedora kexec-tools test only!
+
+1. What is this?
+   This script will reboot current system and trigger a panic to estimate real
+   kdump memory usage. 
+
+2. How it works?
+
+   1) This script will create a hard link for currently running kernel, and
+   will create a grub entry named "kdump-estimate". Then it will update kernel
+   commandline args crashkernel to a bigger number(1/4 of the system RAM, up
+   to 16GB). The next boot will be set to it by grub-reboot.
+
+   2) Create kdump-estimate.service for trigger a panic and collect kdump logs
+   on booting. Create kdump-esimate-cleanup.service for cleaning grub entries
+   and other temporary files.
+
+   3) Rebuild kdump initramfs with rd.memdebug=4, then trigger a panic.
+
+   4) The result will be saved in /var/kdump/kdump-estimate.
+
+3. How to use?
+
+   1) You can clone this repo or just copy this script and run it:
+   ```
+   # ./kdump-estimate estimate
+   ```
+
+   2) Wait a while, it may take long time because it needs reboot system twice.
+
+   3) Login the system and check the report:
+   ```
+   # ./kdump-estimate report
+   ```
+
+4. Limitation
+
+   1) Only tested on X86_64.
+
+   2) Only support fs, nfs and ssh as dump target.
+
+   3) Grubby is required.
